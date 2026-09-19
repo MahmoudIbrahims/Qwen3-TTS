@@ -13,6 +13,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# ============================================================================
+# MODIFIED: dataset.py's collate_fn now builds a 6-token codec preamble
+# (was 5) to carry an explicit lang_id, which shifted the speaker-embedding
+# slot from position 6 to position 7 (see codec_embedding_mask[i, PREFIX-2]
+# in the modified dataset.py). This script's speaker-embedding injection
+# below is updated to match (was `[:, 6, :]`, now `[:, 7, :]`).
+# ============================================================================
 import argparse
 import json
 import os
@@ -26,6 +34,10 @@ from safetensors.torch import save_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
+
+# CHANGED: single source of truth for the speaker-embedding slot position,
+# must always match PREFIX-2 in dataset.py's collate_fn (PREFIX=9 -> slot=7).
+SPEAKER_EMBEDDING_SLOT = 7  # was 6 before language conditioning was added
 
 target_speaker_embedding = None
 def train():
@@ -88,7 +100,9 @@ def train():
 
                 input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-                input_codec_embedding[:, 6, :] = speaker_embedding
+                # CHANGED: was `input_codec_embedding[:, 6, :] = speaker_embedding`
+                # Must match dataset.py's shifted speaker slot (PREFIX-2 = 7).
+                input_codec_embedding[:, SPEAKER_EMBEDDING_SLOT, :] = speaker_embedding
 
                 input_embeddings = input_text_embedding + input_codec_embedding
 

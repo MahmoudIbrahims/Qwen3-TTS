@@ -1,18 +1,3 @@
-# coding=utf-8
-# Copyright 2026 The Alibaba Qwen team.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 from typing import Any, List, Tuple, Union
 
 import librosa
@@ -36,6 +21,10 @@ class TTSDataset(Dataset):
         self.processor = processor
         self.lag_num = lag_num
         self.config = config
+        # CHANGED: build a case-insensitive lookup for language -> codec ID
+        self._lang_map_lower = {
+            k.lower(): v for k, v in self.config.talker_config.codec_language_id.items()
+        }
 
     def __len__(self):
         return len(self.data_list)
@@ -99,7 +88,30 @@ class TTSDataset(Dataset):
         input_id = input["input_ids"]
         input_id = input_id.unsqueeze(0) if input_id.dim() == 1 else input_id
         return input_id
-    
+
+    # CHANGED: new helper -- resolves a language string to its codec ID.
+    # Raises a clear error instead of silently ignoring the language, which
+    # is what the original code effectively did.
+    def _resolve_lang_id(self, language: str) -> int:
+        if language is None or language.lower() == "auto":
+            raise ValueError(
+                "Every training sample must have an explicit 'language' "
+                "field matching a key in config.talker_config.codec_language_id "
+                f"(available: {list(self.config.talker_config.codec_language_id.keys())}). "
+                "'Auto' / missing language is no longer silently accepted, "
+                "because the model must see an explicit language token to "
+                "learn it -- add a 'language' field to every line of your "
+                "training jsonl."
+            )
+        lang_id = self._lang_map_lower.get(language.lower())
+        if lang_id is None:
+            raise ValueError(
+                f"Language '{language}' not found in "
+                f"config.talker_config.codec_language_id. "
+                f"Available: {list(self.config.talker_config.codec_language_id.keys())}"
+            )
+        return lang_id
+
     @torch.inference_mode()
     def extract_mels(self, audio, sr):
         assert sr == 24000, "Only support 24kHz audio"
@@ -126,6 +138,9 @@ class TTSDataset(Dataset):
         language        = item.get('language','Auto')
         ref_audio_path  = item['ref_audio']
 
+        # CHANGED: resolve language -> codec ID here, so it's ready for collate_fn
+        lang_id = self._resolve_lang_id(language)
+
         text = self._build_assistant_text(text)
         text_ids = self._tokenize_texts(text)
 
@@ -140,14 +155,20 @@ class TTSDataset(Dataset):
         return {
             "text_ids": text_ids[:,:-5],    # 1 , t
             "audio_codes":audio_codes,      # t, 16
-            "ref_mel":ref_mel
+            "ref_mel":ref_mel,
+            "lang_id": lang_id,             # CHANGED: now carried through to collate_fn
         }
         
     def collate_fn(self, batch):
         assert self.lag_num == -1
 
+        # CHANGED: overhead grew from 8 to 9 positions because the codec
+        # preamble now carries an explicit lang_id token (6 tokens instead
+        # of 5): [think_id, think_bos_id, lang_id, think_eos_id, speaker(0), pad_id]
+        PREFIX = 9  # was 8
+
         item_length = [b['text_ids'].shape[1] + b['audio_codes'].shape[0] for b in batch]
-        max_length = max(item_length) + 8
+        max_length = max(item_length) + PREFIX
         b,t = len(batch),max_length
 
         input_ids   = torch.zeros((b,t,2),dtype=torch.long)
@@ -162,46 +183,51 @@ class TTSDataset(Dataset):
             text_ids        = data['text_ids']
             audio_codec_0   = data['audio_codes'][:,0]
             audio_codecs    = data['audio_codes']
+            lang_id         = data['lang_id']  # CHANGED
 
             text_ids_len = text_ids.shape[1]
             codec_ids_len = audio_codec_0.shape[0]
             
             # text channel
             input_ids[i,  :3, 0] = text_ids[0,:3]
-            input_ids[i, 3:7, 0] = self.config.tts_pad_token_id
-            input_ids[i,   7, 0] = self.config.tts_bos_token_id
-            input_ids[i, 8:8+text_ids_len-3, 0] = text_ids[0,3:]
-            input_ids[i,   8+text_ids_len-3, 0] = self.config.tts_eos_token_id
-            input_ids[i, 8+text_ids_len-2:8+text_ids_len+codec_ids_len , 0] = self.config.tts_pad_token_id
-            text_embedding_mask[i,  :8+text_ids_len+codec_ids_len] = True
+            input_ids[i, 3:PREFIX-1, 0] = self.config.tts_pad_token_id
+            input_ids[i,   PREFIX-1, 0] = self.config.tts_bos_token_id
+            input_ids[i, PREFIX:PREFIX+text_ids_len-3, 0] = text_ids[0,3:]
+            input_ids[i,   PREFIX+text_ids_len-3, 0] = self.config.tts_eos_token_id
+            input_ids[i, PREFIX+text_ids_len-2:PREFIX+text_ids_len+codec_ids_len , 0] = self.config.tts_pad_token_id
+            text_embedding_mask[i,  :PREFIX+text_ids_len+codec_ids_len] = True
 
             # codec channel
             # input_ids[i,   :3, 1] = 0
-            input_ids[i,    3:8 ,1] = torch.tensor(
+            # CHANGED: 6-token preamble (was 5) carrying the explicit lang_id.
+            # Uses codec_think_id (was codec_nothink_id) since a language IS
+            # being specified now.
+            input_ids[i,    3:PREFIX ,1] = torch.tensor(
                                         [
-                                            self.config.talker_config.codec_nothink_id,
+                                            self.config.talker_config.codec_think_id,
                                             self.config.talker_config.codec_think_bos_id,
+                                            lang_id,
                                             self.config.talker_config.codec_think_eos_id,
                                             0,     # for speaker embedding
-                                            self.config.talker_config.codec_pad_id       
+                                            self.config.talker_config.codec_pad_id
                                         ]
                                     )
-            input_ids[i,    8:8+text_ids_len-3  ,1] = self.config.talker_config.codec_pad_id
-            input_ids[i,    8+text_ids_len-3    ,1] = self.config.talker_config.codec_pad_id
-            input_ids[i,    8+text_ids_len-2    ,1] = self.config.talker_config.codec_bos_id
-            input_ids[i,    8+text_ids_len-1:8+text_ids_len-1+codec_ids_len,    1] = audio_codec_0
-            input_ids[i,    8+text_ids_len-1+codec_ids_len,    1] = self.config.talker_config.codec_eos_token_id
+            input_ids[i,    PREFIX:PREFIX+text_ids_len-3  ,1] = self.config.talker_config.codec_pad_id
+            input_ids[i,    PREFIX+text_ids_len-3    ,1] = self.config.talker_config.codec_pad_id
+            input_ids[i,    PREFIX+text_ids_len-2    ,1] = self.config.talker_config.codec_bos_id
+            input_ids[i,    PREFIX+text_ids_len-1:PREFIX+text_ids_len-1+codec_ids_len,    1] = audio_codec_0
+            input_ids[i,    PREFIX+text_ids_len-1+codec_ids_len,    1] = self.config.talker_config.codec_eos_token_id
 
-            codec_0_labels[i,    8+text_ids_len-1:8+text_ids_len-1+codec_ids_len] = audio_codec_0
-            codec_0_labels[i,    8+text_ids_len-1+codec_ids_len] = self.config.talker_config.codec_eos_token_id
+            codec_0_labels[i,    PREFIX+text_ids_len-1:PREFIX+text_ids_len-1+codec_ids_len] = audio_codec_0
+            codec_0_labels[i,    PREFIX+text_ids_len-1+codec_ids_len] = self.config.talker_config.codec_eos_token_id
 
-            codec_ids[i, 8+text_ids_len-1:8+text_ids_len-1+codec_ids_len,:] = audio_codecs
+            codec_ids[i, PREFIX+text_ids_len-1:PREFIX+text_ids_len-1+codec_ids_len,:] = audio_codecs
 
-            codec_embedding_mask[i, 3:8+text_ids_len+codec_ids_len] = True
-            codec_embedding_mask[i, 6] = False       # for speaker embedding
+            codec_embedding_mask[i, 3:PREFIX+text_ids_len+codec_ids_len] = True
+            codec_embedding_mask[i, PREFIX-2] = False       # CHANGED: speaker slot shifted from 6 to PREFIX-2 (=7)
 
-            codec_mask[i,   8+text_ids_len-1:8+text_ids_len-1+codec_ids_len] = True
-            attention_mask[i, :8+text_ids_len+codec_ids_len] = True
+            codec_mask[i,   PREFIX+text_ids_len-1:PREFIX+text_ids_len-1+codec_ids_len] = True
+            attention_mask[i, :PREFIX+text_ids_len+codec_ids_len] = True
         
         ref_mels = [data['ref_mel'] for data in batch]
         ref_mels = torch.cat(ref_mels,dim=0)
