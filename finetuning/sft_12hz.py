@@ -53,7 +53,10 @@ def train():
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     args = parser.parse_args()
 
-    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
+    # accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
+
+    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16")
+
 
     MODEL_PATH = args.init_model_path
 
