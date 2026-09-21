@@ -286,7 +286,10 @@ def train():
         print("[warn] --speaker_name is ignored. Speaker identity is now "
               "read per-sample from the 'speaker' field in train_jsonl.")
 
-    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
+    # accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
+
+    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16")
+
 
     MODEL_PATH = args.init_model_path
 
@@ -343,7 +346,9 @@ def train():
                 # CHANGED: was `input_codec_embedding[:, 6, :] = speaker_embedding`
                 input_codec_embedding[:, SPEAKER_EMBEDDING_SLOT, :] = speaker_embedding
 
-                input_embeddings = input_text_embedding + input_codec_embedding
+                # input_embeddings = input_text_embedding + input_codec_embedding
+                input_embeddings = model.talker.text_projection(input_text_embedding) + input_codec_embedding
+
 
                 for i in range(1, 16):
                     codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
